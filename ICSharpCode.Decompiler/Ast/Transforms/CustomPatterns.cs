@@ -19,15 +19,15 @@
 using System;
 using System.Linq;
 using dnlib.DotNet;
-using dnSpy.NRefactory;
+using dnSpy.Decompiler.Shared;
 using ICSharpCode.NRefactory.CSharp;
 using ICSharpCode.NRefactory.PatternMatching;
 
 namespace ICSharpCode.Decompiler.Ast.Transforms {
 	sealed class TypePattern : Pattern
 	{
-		readonly string ns;
-		readonly string name;
+		readonly UTF8String ns;
+		readonly UTF8String name;
 		
 		public TypePattern(Type type)
 		{
@@ -49,7 +49,7 @@ namespace ICSharpCode.Decompiler.Ast.Transforms {
 					return false;
 			}
 			ITypeDefOrRef tr = o.Annotation<ITypeDefOrRef>();
-			return tr != null && tr.Namespace == ns && tr.Name == name;
+			return tr.Compare(ns, name);
 		}
 		
 		public override string ToString()
@@ -91,8 +91,8 @@ namespace ICSharpCode.Decompiler.Ast.Transforms {
 		
 		public TypeOfPattern(string groupName)
 		{
-			childNode = new TypePattern(typeof(Type)).ToType().Invoke2(TextTokenType.StaticMethod,
-				"GetTypeFromHandle", new TypeOfExpression(new AnyNode(groupName)).Member("TypeHandle", TextTokenType.InstanceProperty));
+			childNode = new TypePattern(typeof(Type)).ToType().Invoke2(TextTokenKind.StaticMethod,
+				"GetTypeFromHandle", new TypeOfExpression(new AnyNode(groupName)).Member("TypeHandle", TextTokenKind.InstanceProperty));
 		}
 		
 		public override bool DoMatch(INode other, Match match)

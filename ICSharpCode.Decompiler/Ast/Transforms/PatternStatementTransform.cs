@@ -20,8 +20,9 @@ using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Linq;
+using System.Text;
 using dnlib.DotNet;
-using dnSpy.NRefactory;
+using dnSpy.Decompiler.Shared;
 using ICSharpCode.Decompiler.ILAst;
 using ICSharpCode.NRefactory.CSharp;
 using ICSharpCode.NRefactory.CSharp.Analysis;
@@ -31,10 +32,19 @@ namespace ICSharpCode.Decompiler.Ast.Transforms {
 	/// <summary>
 	/// Finds the expanded form of using statements using pattern matching and replaces it with a UsingStatement.
 	/// </summary>
-	public sealed class PatternStatementTransform : ContextTrackingVisitor<AstNode>, IAstTransform
+	public sealed class PatternStatementTransform : ContextTrackingVisitor<AstNode>, IAstTransformPoolObject
 	{
+		readonly StringBuilder stringBuilder;
+
 		public PatternStatementTransform(DecompilerContext context) : base(context)
 		{
+			this.stringBuilder = new StringBuilder();
+			Reset(context);
+		}
+
+		public void Reset(DecompilerContext context)
+		{
+			this.context = context;
 		}
 		
 		#region Visitor Overrides
@@ -57,11 +67,12 @@ namespace ICSharpCode.Decompiler.Ast.Transforms {
 		public override AstNode VisitExpressionStatement(ExpressionStatement expressionStatement, object data)
 		{
 			AstNode result;
-			if (context.Settings.UsingStatement) {
-				result = TransformUsings(expressionStatement);
+			if (context.Settings.UsingStatement)
+			{
+				result = TransformNonGenericForEach(expressionStatement);
 				if (result != null)
 					return result;
-				result = TransformNonGenericForEach(expressionStatement);
+				result = TransformUsings(expressionStatement);
 				if (result != null)
 					return result;
 			}
@@ -106,7 +117,7 @@ namespace ICSharpCode.Decompiler.Ast.Transforms {
 		
 		public override AstNode VisitPropertyDeclaration(PropertyDeclaration propertyDeclaration, object data)
 		{
-			if (context.Settings.AutomaticProperties) {
+			if (context.Settings.AutomaticProperties && !context.Settings.ForceShowAllMembers) {
 				AstNode result = TransformAutomaticProperties(propertyDeclaration);
 				if (result != null)
 					return result;
@@ -118,7 +129,7 @@ namespace ICSharpCode.Decompiler.Ast.Transforms {
 		{
 			// first apply transforms to the accessor bodies
 			base.VisitCustomEventDeclaration(eventDeclaration, data);
-			if (context.Settings.AutomaticEvents) {
+			if (context.Settings.AutomaticEvents && !context.Settings.ForceShowAllMembers) {
 				AstNode result = TransformAutomaticEvents(eventDeclaration);
 				if (result != null)
 					return result;
@@ -155,7 +166,9 @@ namespace ICSharpCode.Decompiler.Ast.Transforms {
 			};
 		}
 		
-		static readonly AstNode usingTryCatchPattern = new TryCatchStatement {
+		static readonly AstNode usingTryCatchPattern = new Choice {
+			{ "c#/vb",
+			new TryCatchStatement {
 			TryBlock = new AnyNode(),
 			FinallyBlock = new BlockStatement {
 				new Choice {
@@ -175,6 +188,33 @@ namespace ICSharpCode.Decompiler.Ast.Transforms {
 						}
 					}
 				}.ToStatement()
+			}
+		}
+		},
+		{ "f#",
+			new TryCatchStatement {
+			TryBlock = new AnyNode(),
+			FinallyBlock =
+					new BlockStatement {
+						new ExpressionStatement(
+							new AssignmentExpression(left: new NamedNode("disposable", new IdentifierExpression(Pattern.AnyString)),
+														right: new AsExpression(expression: new NamedNode("ident", new IdentifierExpression(Pattern.AnyString)),
+																				type: new TypePattern(typeof(IDisposable))
+																				)
+							)
+						),
+						new IfElseStatement {
+							Condition = new BinaryOperatorExpression(
+								new Backreference("disposable"),
+								BinaryOperatorType.InEquality,
+								new NullReferenceExpression()
+							),
+							TrueStatement = new BlockStatement {
+								new ExpressionStatement(InvokeDispose(new Backreference("disposable")))
+							}
+						}
+					}
+				}
 			}
 		};
 		
@@ -212,9 +252,20 @@ namespace ICSharpCode.Decompiler.Ast.Transforms {
 			// Validate that the variable is not used after the using statement:
 			if (!IsVariableValueUnused(varDecl, tryCatch))
 				return null;
-			
+
+			if (m2.Has("f#")) {
+				string variableNameDisposable = m2.Get<IdentifierExpression>("disposable").Single().Identifier;
+				VariableDeclarationStatement varDeclDisposable = FindVariableDeclaration(node, variableNameDisposable);
+				if (varDeclDisposable == null || !(varDeclDisposable.Parent is BlockStatement))
+					return null;
+
+				// Validate that the variable is not used after the using statement:
+				if (!IsVariableValueUnused(varDeclDisposable, tryCatch))
+					return null;
+			}
+
 			node.Remove();
-			
+
 			UsingStatement usingStatement = new UsingStatement();
 			tryCatch.TryBlock.HiddenEnd = tryCatch.FinallyBlock.Detach();
 			usingStatement.EmbeddedStatement = tryCatch.TryBlock.Detach();
@@ -228,7 +279,7 @@ namespace ICSharpCode.Decompiler.Ast.Transforms {
 					Type = (AstType)varDecl.Type.Clone(),
 					Variables = {
 						new VariableInitializer {
-							NameToken = Identifier.Create(variableName).WithAnnotation(TextTokenType.Local),
+							NameToken = Identifier.Create(variableName).WithAnnotation(TextTokenKind.Local),
 							Initializer = m1.Get<Expression>("initializer").Single().Detach()
 						}.CopyAnnotationsFrom(node.Expression)
 							.WithAnnotation(m1.Get<AstNode>("variable").Single().Annotation<ILVariable>())
@@ -346,7 +397,7 @@ namespace ICSharpCode.Decompiler.Ast.Transforms {
 						new AssignmentExpression {
 							Left = new IdentifierExpression(Pattern.AnyString).WithName("itemVariable"),
 							Operator = AssignmentOperatorType.Assign,
-							Right = new IdentifierExpressionBackreference("enumeratorVariable").ToExpression().Member("Current", TextTokenType.InstanceProperty)
+							Right = new IdentifierExpressionBackreference("enumeratorVariable").ToExpression().Member("Current", TextTokenKind.InstanceProperty)
 						}.WithName("getCurrent"),
 						new Repeat(new AnyNode("statement")).ToStatement()
 					}
@@ -413,13 +464,13 @@ namespace ICSharpCode.Decompiler.Ast.Transforms {
 		#endregion
 		
 		#region foreach (non-generic)
-		ExpressionStatement getEnumeratorPattern = new ExpressionStatement(
+		static readonly ExpressionStatement getEnumeratorPattern = new ExpressionStatement(
 			new AssignmentExpression(
 				new NamedNode("left", new IdentifierExpression(Pattern.AnyString)),
 				new AnyNode("collection").ToExpression().Invoke("GetEnumerator")
 			).WithName("getEnumeratorAssignment"));
 		
-		TryCatchStatement nonGenericForeachPattern = new TryCatchStatement {
+		static readonly TryCatchStatement nonGenericForeachPattern = new TryCatchStatement {
 			TryBlock = new BlockStatement {
 				new WhileStatement {
 					Condition = new IdentifierExpression(Pattern.AnyString).WithName("enumerator").Invoke("MoveNext"),
@@ -427,10 +478,10 @@ namespace ICSharpCode.Decompiler.Ast.Transforms {
 						new AssignmentExpression(
 							new IdentifierExpression(Pattern.AnyString).WithName("itemVar"),
 							new Choice {
-								new Backreference("enumerator").ToExpression().Member("Current", TextTokenType.InstanceProperty),
+								new Backreference("enumerator").ToExpression().Member("Current", TextTokenKind.InstanceProperty),
 								new CastExpression {
 									Type = new AnyNode("castType"),
-									Expression = new Backreference("enumerator").ToExpression().Member("Current", TextTokenType.InstanceProperty)
+									Expression = new Backreference("enumerator").ToExpression().Member("Current", TextTokenKind.InstanceProperty)
 								}
 							}
 						).WithName("getCurrent"),
@@ -515,7 +566,7 @@ namespace ICSharpCode.Decompiler.Ast.Transforms {
 
 			var tc = (TryCatchStatement)tryCatch;
 			foreachStatement.HiddenGetEnumeratorNode = NRefactoryExtensions.CreateHidden(tc.TryBlock.HiddenStart, m1.Get<AssignmentExpression>("getEnumeratorAssignment").Single());
-			foreachStatement.HiddenGetEnumeratorNode = NRefactoryExtensions.CreateHidden(tc.TryBlock.GetAllILRanges(), foreachStatement.HiddenGetEnumeratorNode);
+			foreachStatement.HiddenGetEnumeratorNode = NRefactoryExtensions.CreateHidden(ILRange.OrderAndJoinList(tc.TryBlock.GetAllILRanges()), foreachStatement.HiddenGetEnumeratorNode);
 			foreachStatement.HiddenMoveNextNode = loop.Condition;
 			foreachStatement.HiddenGetCurrentNode = m2.Get<AstNode>("getCurrent").Single();
 			var oldBody = loop.EmbeddedStatement as BlockStatement;
@@ -614,20 +665,20 @@ namespace ICSharpCode.Decompiler.Ast.Transforms {
 				ifStmt.AddAllRecursiveILRangesTo(doLoop.Condition);
 				doLoop.EmbeddedStatement = block.Detach();
 				whileLoop.ReplaceWith(doLoop);
-				block.HiddenStart = NRefactoryExtensions.CreateHidden(whileLoop.Condition.GetAllRecursiveILRanges(), block.HiddenStart);
+				block.HiddenStart = NRefactoryExtensions.CreateHidden(ILRange.OrderAndJoinList(whileLoop.Condition.GetAllRecursiveILRanges()), block.HiddenStart);
 				
 				// we may have to extract variable definitions out of the loop if they were used in the condition:
 				foreach (var varDecl in block.Statements.OfType<VariableDeclarationStatement>()) {
 					VariableInitializer v = varDecl.Variables.Single();
 					if (doLoop.Condition.DescendantsAndSelf.OfType<IdentifierExpression>().Any(i => i.Identifier == v.Name)) {
-						TextTokenType? tokenType = null;
+						TextTokenKind? tokenKind = null;
 						var ilv = v.Annotation<ILVariable>();
 						if (ilv != null)
-							tokenType = ilv.IsParameter ? TextTokenType.Parameter : TextTokenType.Local;
+							tokenKind = ilv.IsParameter ? TextTokenKind.Parameter : TextTokenKind.Local;
 						var locParam = v.Annotation<IVariable>();
-						if (tokenType == null && locParam != null)
-							tokenType = TextTokenHelper.GetTextTokenType(locParam);
-						AssignmentExpression assign = new AssignmentExpression(IdentifierExpression.Create(v.Name, tokenType ?? TextTokenType.Local), v.Initializer.Detach());
+						if (tokenKind == null && locParam != null)
+							tokenKind = TextTokenKindUtils.GetTextTokenType(locParam);
+						AssignmentExpression assign = new AssignmentExpression(IdentifierExpression.Create(v.Name, tokenKind ?? TextTokenKind.Local), v.Initializer.Detach());
 						// move annotations from v to assign:
 						assign.CopyAnnotationsFrom(v);
 						v.RemoveAnnotations<object>();
@@ -656,7 +707,7 @@ namespace ICSharpCode.Decompiler.Ast.Transforms {
 			TryBlock = new BlockStatement {
 				new OptionalNode(new VariableDeclarationStatement()).ToStatement(),
 				new TypePattern(typeof(System.Threading.Monitor)).ToType().Invoke2(
-					TextTokenType.StaticMethod,
+					TextTokenKind.StaticMethod,
 					"Enter", new AnyNode("enter"),
 					new DirectionExpression {
 						FieldDirection = FieldDirection.Ref,
@@ -668,7 +719,7 @@ namespace ICSharpCode.Decompiler.Ast.Transforms {
 				new IfElseStatement {
 					Condition = new Backreference("flag"),
 					TrueStatement = new BlockStatement {
-						new TypePattern(typeof(System.Threading.Monitor)).ToType().Invoke2(TextTokenType.StaticMethod, "Exit", new AnyNode("exit"))
+						new TypePattern(typeof(System.Threading.Monitor)).ToType().Invoke2(TextTokenKind.StaticMethod, "Exit", new AnyNode("exit"))
 					}
 				}
 			}};
@@ -947,21 +998,21 @@ namespace ICSharpCode.Decompiler.Ast.Transforms {
 				Body = new BlockStatement {
 					new AssignmentExpression {
 						Left = new Backreference("fieldReference"),
-						Right = IdentifierExpression.Create("value", TextTokenType.Keyword)
+						Right = IdentifierExpression.Create("value", TextTokenKind.Keyword)
 					}
 				}}};
 		
 		PropertyDeclaration TransformAutomaticProperties(PropertyDeclaration property)
 		{
-			PropertyDef cecilProperty = property.Annotation<PropertyDef>();
-			if (cecilProperty == null || cecilProperty.GetMethod == null || cecilProperty.SetMethod == null)
+			PropertyDef prop = property.Annotation<PropertyDef>();
+			if (prop == null || prop.GetMethod == null || prop.SetMethod == null)
 				return null;
-			if (!(cecilProperty.GetMethod.IsCompilerGenerated() && cecilProperty.SetMethod.IsCompilerGenerated()))
+			if (!(prop.GetMethod.IsCompilerGenerated() && prop.SetMethod.IsCompilerGenerated()))
 				return null;
 			Match m = automaticPropertyPattern.Match(property);
 			if (m.Success) {
 				FieldDef field = m.Get<AstNode>("fieldReference").Single().Annotation<IField>().ResolveFieldWithinSameModule();
-				if (field != null && field.IsCompilerGenerated() && field.DeclaringType == cecilProperty.DeclaringType) {
+				if (field != null && field.IsCompilerGenerated() && field.DeclaringType == prop.DeclaringType) {
 					RemoveCompilerGeneratedAttribute(property.Getter.Attributes);
 					RemoveCompilerGeneratedAttribute(property.Setter.Attributes);
 					var getterMM = property.Getter.Body.Annotation<MemberMapping>();
@@ -972,22 +1023,24 @@ namespace ICSharpCode.Decompiler.Ast.Transforms {
 						property.Setter.AddAnnotation(setterMM);
 					property.Getter.Body = null;
 					property.Setter.Body = null;
-					if (cecilProperty.GetMethod.Body != null)
-						property.Getter.AddAnnotation(new List<ILRange> { new ILRange(0, (uint)cecilProperty.GetMethod.Body.GetCodeSize()) });
-					if (cecilProperty.SetMethod.Body != null)
-						property.Setter.AddAnnotation(new List<ILRange> { new ILRange(0, (uint)cecilProperty.SetMethod.Body.GetCodeSize()) });
+					if (prop.GetMethod.Body != null)
+						property.Getter.AddAnnotation(new List<ILRange> { new ILRange(0, (uint)prop.GetMethod.Body.GetCodeSize()) });
+					if (prop.SetMethod.Body != null)
+						property.Setter.AddAnnotation(new List<ILRange> { new ILRange(0, (uint)prop.SetMethod.Body.GetCodeSize()) });
 				}
 			}
 			// Since the event instance is not changed, we can continue in the visitor as usual, so return null
 			return null;
 		}
-		
+
+		static readonly UTF8String systemRuntimeCompilerServicesString = new UTF8String("System.Runtime.CompilerServices");
+		static readonly UTF8String compilerGeneratedAttributeString = new UTF8String("CompilerGeneratedAttribute");
 		void RemoveCompilerGeneratedAttribute(AstNodeCollection<AttributeSection> attributeSections)
 		{
 			foreach (AttributeSection section in attributeSections) {
 				foreach (var attr in section.Attributes) {
 					ITypeDefOrRef tr = attr.Type.Annotation<ITypeDefOrRef>();
-					if (tr != null && tr.Namespace == "System.Runtime.CompilerServices" && tr.Name == "CompilerGeneratedAttribute") {
+					if (tr != null && tr.Compare(systemRuntimeCompilerServicesString, compilerGeneratedAttributeString)) {
 						attr.Remove();
 					}
 				}
@@ -1022,13 +1075,13 @@ namespace ICSharpCode.Decompiler.Ast.Transforms {
 							Operator = AssignmentOperatorType.Assign,
 							Right = new AnyNode("delegateCombine").ToExpression().Invoke(
 								new IdentifierExpressionBackreference("var2"),
-								IdentifierExpression.Create("value", TextTokenType.Keyword)
+								IdentifierExpression.Create("value", TextTokenKind.Keyword)
 							).CastTo(new Backreference("type"))
 						},
 						new AssignmentExpression {
 							Left = new IdentifierExpressionBackreference("var1"),
 							Right = new TypePattern(typeof(System.Threading.Interlocked)).ToType().Invoke(
-								TextTokenType.StaticMethod,
+								TextTokenKind.StaticMethod,
 								"CompareExchange",
 								new AstType[] { new Backreference("type") }, // type argument
 								new Expression[] { // arguments
@@ -1075,7 +1128,7 @@ namespace ICSharpCode.Decompiler.Ast.Transforms {
 			}
 			ed.ReturnType = ev.ReturnType.Detach();
 			ed.Modifiers = ev.Modifiers;
-			ed.Variables.Add(new VariableInitializer(TextTokenHelper.GetTextTokenType(ev.Annotation<EventDef>()), ev.Name));
+			ed.Variables.Add(new VariableInitializer(TextTokenKindUtils.GetTextTokenType(ev.Annotation<EventDef>()), ev.Name));
 			ed.CopyAnnotationsFrom(ev);
 
 			// Keep the token comments
@@ -1102,7 +1155,7 @@ namespace ICSharpCode.Decompiler.Ast.Transforms {
 				FieldDef field = eventDef.DeclaringType.Fields.FirstOrDefault(f => f.Name == ev.Name);
 				if (field != null) {
 					ed.AddAnnotation(field);
-					AstBuilder.ConvertAttributes(ed, field, "field");
+					AstBuilder.ConvertAttributes(ed, field, stringBuilder, "field");
 				}
 			}
 			
